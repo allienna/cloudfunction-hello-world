@@ -1,0 +1,128 @@
+steps:
+
+########################################################################################################################
+# Workspace configuration:
+#  - Decrypt ssh GitHub key to allow communication between services
+#  - Setup Git credentials
+#  - Remove sources in workspace since these sources come from a tarball of the project but it does take .git config
+#  - Clone the project for the current branch
+#  - Add CloudBuild user information in Git configuration
+########################################################################################################################
+  - id: 'decrypt-key'
+    name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - kms
+      - decrypt
+      - --ciphertext-file=cloudbuild/id_rsa.enc
+      - --plaintext-file=/root/.ssh/id_rsa
+      - --location=global
+      - --keyring=github-writer
+      - --key=github-key
+      - --project=calculator-demo-sfeir
+    volumes:
+      - name: 'ssh'
+        path: '/root/.ssh'
+
+  - id: 'set-up-git-credentials'
+    name: 'gcr.io/cloud-builders/git'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        chmod 600 /root/.ssh/id_rsa
+        cat <<EOF >/root/.ssh/config
+        Hostname github.com
+        IdentityFile /root/.ssh/id_rsa
+        EOF
+        mv cloudbuild/known_hosts /root/.ssh/known_hosts
+    volumes:
+      - name: 'ssh'
+        path: '/root/.ssh'
+
+  - id: 'rm-tarball-source'
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        rm -rf * .versionrc .git*
+
+  - id: 'git-clone'
+    name: 'gcr.io/cloud-builders/git'
+    args:
+      - clone
+      - --branch=$BRANCH_NAME
+      - --single-branch
+      - git@github.com:allienna/cloudfunction-hello-world.git
+      - .
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
+
+  - id: 'git-config'
+    name: 'gcr.io/cloud-builders/git'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        git config user.email "cloudbuildm@allienna.com"
+        git config user.name "CloudBuild"
+
+########################################################################################################################
+# Validate that the last commit is not a release. If a commit start with "chore(release): ", the build will fail
+#
+# see makefiles/release.mk
+########################################################################################################################
+  - id: 'check-last-commits'
+    name: 'gcr.io/calculator-demo-sfeir/standard-version'
+    entrypoint: 'make'
+    args: ["check-last-commit"]
+    waitFor: ['git-clone']
+
+########################################################################################################################
+# Freeze a version
+#  - If branch == master, release a version, add a tag and update the changelog
+#  - For dev branches, add the branch name at the end of the version identifier
+#
+# see makefiles/version.mk for more details
+########################################################################################################################
+  - id: 'release'
+    name: 'gcr.io/$PROJECT_ID/standard-version'
+    entrypoint: 'make'
+    args: ["release"]
+    env:
+      - 'GIT_BRANCH=$BRANCH_NAME'
+#   You may consider to use ssh volume
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
+########################################################################################################################
+# Run tests
+########################################################################################################################
+  - id: 'unit-test'
+    name: 'python:3.7-slim'
+    entrypoint: /bin/sh
+    args:
+      - -c
+      - 'pip install -r requirements.txt'
+      - 'python -m unittest discover --verbose'
+
+########################################################################################################################
+# Commit CHANGELOG.md and push tag for this version
+########################################################################################################################
+  - id: 'commit-and-push'
+    name: 'gcr.io/calculator-demo-sfeir/standard-version'
+    entrypoint: 'make'
+    args: ['commit-and-push-release']
+    env:
+      - 'GIT_BRANCH=$BRANCH_NAME'
+    volumes:
+      - name: 'ssh'
+        path: '/root/.ssh'
+
+########################################################################################################################
+# Deploy function
+########################################################################################################################
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args: ['functions', 'deploy', 'hello-world', '--trigger-http', '--runtime', 'python37', '--entry-point', 'hello_http']
+
